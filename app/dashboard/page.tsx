@@ -1,26 +1,11 @@
-import { createClient } from '@/lib/supabase/server'
+import { getDashboardData } from '@/lib/local-db'
 import { Database, Users, Search, TrendingUp, Clock, Star } from 'lucide-react'
 import Link from 'next/link'
-import { redirect } from 'next/navigation'
+
+export const dynamic = 'force-dynamic'
 
 export default async function DashboardPage() {
-  const supabase = createClient()
-  const { data } = await supabase.auth.getUser()
-  const user = data?.user
-
-  if (!user) {
-    redirect('/login')
-  }
-
-  const [{ count: totalBiz }, { count: clients }, { count: contacted }, { data: recentJobs }, { data: topRated }] =
-    await Promise.all([
-      supabase.from('businesses').select('*', { count: 'exact', head: true }).eq('user_id', user.id),
-      supabase.from('businesses').select('*', { count: 'exact', head: true }).eq('user_id', user.id).eq('status', 'client'),
-      supabase.from('businesses').select('*', { count: 'exact', head: true }).eq('user_id', user.id).neq('status', 'not_contacted'),
-      supabase.from('scrape_jobs').select('*').eq('user_id', user.id).order('created_at', { ascending: false }).limit(5),
-      supabase.from('businesses').select('name,rating,reviews_count,city,status').eq('user_id', user.id)
-        .not('rating', 'is', null).order('rating', { ascending: false }).limit(5),
-    ])
+  const { total: totalBiz, clients, contacted, recentJobs, topRated } = getDashboardData()
 
   const stats = [
     { label: 'Total Leads', value: totalBiz || 0, icon: Database, color: 'var(--accent)' },

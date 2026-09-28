@@ -1,6 +1,5 @@
 'use client'
-import { useState, useEffect, useCallback } from 'react'
-import { createClient } from '@/lib/supabase/client'
+import { useState, useEffect } from 'react'
 import { Business, STATUS_CONFIG, BusinessStatus } from '@/lib/types'
 import {
   Search, Filter, Download, ChevronDown, Star, Globe, Mail,
@@ -10,7 +9,6 @@ import {
 const STATUSES = Object.entries(STATUS_CONFIG) as [BusinessStatus, typeof STATUS_CONFIG[BusinessStatus]][]
 
 export default function CRMPage() {
-  const supabase = createClient()
   const [businesses, setBusinesses] = useState<Business[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -40,53 +38,59 @@ export default function CRMPage() {
   useEffect(() => { loadBusinesses(page) }, [page])
 
   async function loadCities() {
-    const { data } = await supabase.from('businesses').select('city').not('city', 'is', null)
-    const unique = [...new Set((data || []).map((d: any) => d.city).filter(Boolean))].sort()
-    setCities(unique as string[])
+    const response = await fetch('/api/local/businesses?cities=1')
+    const payload = await response.json()
+    setCities(payload.cities || [])
   }
 
   async function loadBusinesses(p = 0) {
     setLoading(true)
-    let q = supabase.from('businesses').select('*', { count: 'exact' })
+    const params = new URLSearchParams({
+      page: String(p),
+      pageSize: String(PAGE_SIZE),
+      sortBy,
+      sortAsc: String(sortAsc),
+    })
+    if (search) params.set('search', search)
+    if (statusFilter) params.set('status', statusFilter)
+    if (cityFilter) params.set('city', cityFilter)
+    if (hasWebFilter) params.set('hasWeb', hasWebFilter)
+    if (hasEmailFilter) params.set('hasEmail', hasEmailFilter)
+    if (hasPhoneFilter) params.set('hasPhone', hasPhoneFilter)
+    if (minRating) params.set('minRating', minRating)
+    if (minReviews) params.set('minReviews', minReviews)
+    if (priceFilter) params.set('price', priceFilter)
 
-    if (search) q = q.or(`name.ilike.%${search}%,address.ilike.%${search}%,category.ilike.%${search}%`)
-    if (statusFilter) q = q.eq('status', statusFilter)
-    if (cityFilter) q = q.eq('city', cityFilter)
-    if (hasWebFilter === 'yes') q = q.not('website', 'is', null).neq('website', '')
-    if (hasWebFilter === 'no') q = q.or('website.is.null,website.eq.')
-    if (hasEmailFilter === 'yes') q = q.not('email', 'is', null).neq('email', '')
-    if (hasEmailFilter === 'no') q = q.or('email.is.null,email.eq.')
-    if (hasPhoneFilter === 'yes') q = q.not('phone', 'is', null).neq('phone', '')
-    if (hasPhoneFilter === 'no') q = q.or('phone.is.null,phone.eq.')
-    if (minRating) q = q.gte('rating', parseFloat(minRating))
-    if (minReviews) q = q.gte('reviews_count', parseInt(minReviews))
-    if (priceFilter) q = q.eq('price_range', priceFilter)
-
-    q = q.order(sortBy, { ascending: sortAsc }).range(p * PAGE_SIZE, (p + 1) * PAGE_SIZE - 1)
-
-    const { data, count } = await q
-    setBusinesses(data as Business[] || [])
-    setTotal(count || 0)
+    const response = await fetch(`/api/local/businesses?${params.toString()}`)
+    const payload = await response.json()
+    setBusinesses(payload.data || [])
+    setTotal(payload.total || 0)
     setLoading(false)
   }
 
   async function updateStatus(id: string, status: BusinessStatus) {
-    await supabase.from('businesses').update({ status }).eq('id', id)
+    await fetch(`/api/local/businesses/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
+    })
     setBusinesses(bs => bs.map(b => b.id === id ? { ...b, status } : b))
     if (selected?.id === id) setSelected(s => s ? { ...s, status } : s)
   }
 
   async function saveNote(id: string) {
-    await supabase.from('businesses').update({ notes: noteText }).eq('id', id)
+    await fetch(`/api/local/businesses/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notes: noteText }),
+    })
     setBusinesses(bs => bs.map(b => b.id === id ? { ...b, notes: noteText } : b))
     if (selected?.id === id) setSelected(s => s ? { ...s, notes: noteText } : s)
     setEditingNote(null)
   }
 
   async function exportCSV() {
-    let q = supabase.from('businesses').select('*')
-    if (statusFilter) q = q.eq('status', statusFilter)
-    const { data } = await q
+    const params = new URLSearchParams({ page: '0', pageSize: '1000' })
+    if (statusFilter) params.set('status', statusFilter)
+    const response = await fetch(`/api/local/businesses?${params.toString()}`)
+    const payload = await response.json()
+    const data = payload.data as Business[]
     if (!data?.length) return
     const headers = ['Nombre','Categoría','Dirección','Ciudad','Teléfono','Web','Email',
       'Valoración','Reseñas','Estado','Notas','URL Maps']

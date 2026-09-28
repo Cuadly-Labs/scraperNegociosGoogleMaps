@@ -10,7 +10,6 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'error' | 'cancelled'
 
 export interface Business {
   id: string
-  user_id: string
   job_id?: string
   name: string
   category?: string
@@ -40,7 +39,6 @@ export interface Business {
 
 export interface ScrapeJob {
   id: string
-  user_id: string
   query: string
   zone?: string
   mode: 'simple' | 'grid'
@@ -60,7 +58,6 @@ export interface ScrapeJob {
 
 export interface Followup {
   id: string
-  user_id: string
   business_id: string
   type: 'call' | 'email' | 'meeting' | 'note' | 'whatsapp'
   content?: string

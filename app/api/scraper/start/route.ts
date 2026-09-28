@@ -1,108 +1,103 @@
+import { spawn } from 'node:child_process'
+import path from 'node:path'
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { createJob, getDatabasePath, getJob, updateJob } from '@/lib/local-db'
 
-// ── Pool de cuentas GitHub ────────────────────────────────────────────────────
-// Añade hasta 3 tokens, uno por cuenta. Se rotan automáticamente
-// para repartir el gasto de minutos entre cuentas.
-// En .env.local pon:
-//   GITHUB_TOKEN_1=github_pat_cuenta1...
-//   GITHUB_TOKEN_2=github_pat_cuenta2...
-//   GITHUB_TOKEN_3=github_pat_cuenta3...
-//   GITHUB_REPO=tu-usuario/scrapcrm   ← repo donde está el workflow
-
-function getNextToken(): { token: string; repo: string } | null {
-  const tokens = [
-    { token: process.env.GITHUB_TOKEN_1, repo: process.env.GITHUB_REPO_1 },
-    { token: process.env.GITHUB_TOKEN_2, repo: process.env.GITHUB_REPO_2 },
-    { token: process.env.GITHUB_TOKEN_3, repo: process.env.GITHUB_REPO_3 },
-  ].filter(t => t.token && t.repo) as { token: string; repo: string }[]
-
-  if (!tokens.length) return null
-
-  // Round-robin: usa el índice del minuto actual para rotar
-  const idx = Math.floor(Date.now() / 60000) % tokens.length
-  return tokens[idx]
-}
+export const dynamic = 'force-dynamic'
+export const runtime = 'nodejs'
 
 export async function POST(req: NextRequest) {
-  const supabase = createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
-  const body = await req.json()
-  const { query, location, mode, gridZone, cellKm, maxResults, maxTotal, scrollPause } = body
-
-  if (!query?.trim()) return NextResponse.json({ error: 'Query required' }, { status: 400 })
-
-  const account = getNextToken()
-  if (!account) {
-    return NextResponse.json(
-      { error: 'No GitHub tokens configured. Añade GITHUB_TOKEN_1 y GITHUB_REPO_1 a .env.local' },
-      { status: 500 }
-    )
+  let body: Record<string, unknown>
+  try {
+    body = await req.json()
+  } catch {
+    return NextResponse.json({ error: 'Petición inválida' }, { status: 400 })
   }
 
-  // Crear job en Supabase
-  const { data: job, error: jobError } = await supabase
-    .from('scrape_jobs')
-    .insert({
-      user_id:     user.id,
-      query:       query.trim(),
-      zone:        mode === 'grid' ? gridZone : location,
-      mode:        mode || 'simple',
-      cell_km:     parseFloat(cellKm) || 0,
-      max_results: parseInt(maxResults) || 50,
-      max_total:   parseInt(maxTotal) || 1000,
-      status:      'pending',
+  const query = typeof body.query === 'string' ? body.query.trim() : ''
+  if (!query) return NextResponse.json({ error: 'Query required' }, { status: 400 })
+
+  const mode = body.mode === 'grid' ? 'grid' : 'simple'
+  const location = typeof body.location === 'string' ? body.location : ''
+  const gridZone = typeof body.gridZone === 'string' ? body.gridZone : ''
+  const cellKm = Number(body.cellKm || 0) || 0
+  const maxResults = Number(body.maxResults || 50) || 50
+  const maxTotal = Number(body.maxTotal || 1000) || 1000
+  const scrollPause = Number(body.scrollPause || 2) || 2
+  const job = createJob({
+    query,
+    zone: mode === 'grid' ? gridZone : location,
+    mode,
+    cellKm,
+    maxResults,
+    maxTotal,
+  })
+
+  const python = process.env.SCRAPER_PYTHON_BIN || 'python3'
+  const script = path.join(process.cwd(), 'scraper', 'scraper_api.py')
+  const args = [
+    script,
+    '--job-id', job.id,
+    '--db-path', getDatabasePath(),
+    '--query', query,
+    '--mode', mode,
+    '--location', location,
+    '--grid-zone', gridZone,
+    '--cell-km', String(cellKm),
+    '--max', String(maxResults),
+    '--max-total', String(maxTotal),
+    '--scroll-pause', String(scrollPause),
+    '--headless',
+  ]
+
+  // El modo `npm run dev:trace` usa NODE_OPTIONS para instrumentar Next.
+  // No debe heredarse al Python/Playwright del scraper: su Node interno no es
+  // el worker de Next y esos hooks pueden alterar el diagnóstico o el proceso.
+  const scraperEnv = { ...process.env }
+  delete scraperEnv.NODE_OPTIONS
+  scraperEnv.PYTHONDONTWRITEBYTECODE = '1'
+
+  let child
+  try {
+    child = spawn(python, args, {
+      cwd: process.cwd(),
+      env: scraperEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
-    .select()
-    .single()
-
-  if (jobError) return NextResponse.json({ error: jobError.message }, { status: 500 })
-
-  // Disparar workflow en GitHub Actions
-  const dispatchRes = await fetch(
-    `https://api.github.com/repos/${account.repo}/actions/workflows/scraper.yml/dispatches`,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization':        `Bearer ${account.token}`,
-        'Accept':               'application/vnd.github+json',
-        'Content-Type':         'application/json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-      body: JSON.stringify({
-        ref: 'main',
-        inputs: {
-          job_id:       job.id,
-          user_id:      user.id,
-          query:        query.trim(),
-          mode:         mode || 'simple',
-          location:     location || '',
-          grid_zone:    gridZone || '',
-          cell_km:      String(cellKm || '0'),
-          max_results:  String(maxResults || 50),
-          max_total:    String(maxTotal || 1000),
-          scroll_pause: String(scrollPause || 2.0),
-        },
-      }),
-    }
-  )
-
-  if (!dispatchRes.ok) {
-    const err = await dispatchRes.text()
-    await supabase.from('scrape_jobs').update({
-      status:      'error',
-      error_msg:   `GitHub dispatch failed: ${err}`,
+  } catch (error) {
+    updateJob(job.id, {
+      status: 'error',
+      error_msg: error instanceof Error ? error.message : 'No se pudo iniciar Python',
       finished_at: new Date().toISOString(),
-    }).eq('id', job.id)
-    return NextResponse.json({ error: `GitHub dispatch failed: ${err}` }, { status: 500 })
+    })
+    return NextResponse.json({ error: 'No se pudo iniciar el scraper local' }, { status: 500 })
   }
 
-  await supabase.from('scrape_jobs').update({
-    status:     'running',
-    started_at: new Date().toISOString(),
-  }).eq('id', job.id)
+  child.stdout?.on('data', chunk => console.log(`[scraper ${job.id}] ${chunk.toString().trimEnd()}`))
+  child.stderr?.on('data', chunk => console.error(`[scraper ${job.id}] ${chunk.toString().trimEnd()}`))
+  child.on('error', error => {
+    updateJob(job.id, {
+      status: 'error',
+      error_msg: error.message,
+      finished_at: new Date().toISOString(),
+    })
+  })
+  child.on('close', code => {
+    if (code === 0) return
+    const current = getJob(job.id)
+    if (current?.status === 'pending' || current?.status === 'running') {
+      updateJob(job.id, {
+        status: 'error',
+        error_msg: `El scraper terminó con código ${code ?? 'desconocido'}`,
+        finished_at: new Date().toISOString(),
+      })
+    }
+  })
 
-  return NextResponse.json({ job })
+  const runningJob = updateJob(job.id, {
+    status: 'running',
+    started_at: new Date().toISOString(),
+  })
+
+  return NextResponse.json({ job: runningJob })
 }

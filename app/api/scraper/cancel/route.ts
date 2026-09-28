@@ -1,16 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { getJob, updateJob } from '@/lib/local-db'
+
+export const runtime = 'nodejs'
 
 export async function POST(req: NextRequest) {
-  const supabase = createClient()
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  let body: { jobId?: string }
+  try {
+    body = await req.json()
+  } catch {
+    return NextResponse.json({ error: 'Petición inválida' }, { status: 400 })
+  }
 
-  const { jobId } = await req.json()
-  await supabase.from('scrape_jobs').update({
+  if (!body.jobId) return NextResponse.json({ error: 'jobId requerido' }, { status: 400 })
+  if (!getJob(body.jobId)) return NextResponse.json({ error: 'Job no encontrado' }, { status: 404 })
+
+  updateJob(body.jobId, {
     status: 'cancelled',
     finished_at: new Date().toISOString(),
-  }).eq('id', jobId).eq('user_id', user.id)
+  })
 
   return NextResponse.json({ ok: true })
 }

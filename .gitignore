@@ -1,6 +1,9 @@
 .next/
 node_modules/
 .env.local
+.env
+data/
+*.tsbuildinfo
 *.pyc
 __pycache__/
 .DS_Store

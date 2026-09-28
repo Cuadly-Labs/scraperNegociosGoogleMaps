@@ -1,11 +1,9 @@
 'use client'
 import { useState, useEffect, useRef } from 'react'
-import { createClient } from '@/lib/supabase/client'
 import { PRESET_ZONES } from '@/lib/types'
-import { Play, StopCircle, CheckCircle, AlertCircle, ChevronDown } from 'lucide-react'
+import { Play, StopCircle } from 'lucide-react'
 
 export default function ScraperPage() {
-  const supabase = createClient()
   const [mode, setMode] = useState<'simple' | 'grid'>('simple')
   const [query, setQuery] = useState('')
   const [location, setLocation] = useState('')
@@ -14,7 +12,6 @@ export default function ScraperPage() {
   const [maxResults, setMaxResults] = useState('50')
   const [maxTotal, setMaxTotal] = useState('1000')
   const [scrollPause, setScrollPause] = useState('2.0')
-  const [headless, setHeadless] = useState(true)
   const [activeJob, setActiveJob] = useState<any>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [recentJobs, setRecentJobs] = useState<any[]>([])
@@ -22,6 +19,7 @@ export default function ScraperPage() {
   const logRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    loadActiveJob()
     loadRecentJobs()
     return () => clearInterval(pollRef.current)
   }, [])
@@ -31,28 +29,52 @@ export default function ScraperPage() {
   }, [logs])
 
   async function loadRecentJobs() {
-    const { data } = await supabase.from('scrape_jobs').select('*')
-      .order('created_at', { ascending: false }).limit(10)
-    setRecentJobs(data || [])
+    const response = await fetch('/api/local/jobs')
+    const payload = await response.json()
+    setRecentJobs(payload.jobs || [])
+  }
+
+  async function loadActiveJob() {
+    const response = await fetch('/api/local/jobs')
+    const payload = await response.json()
+    if (payload.activeJob) {
+      setActiveJob(payload.activeJob)
+      startPolling(payload.activeJob.id)
+    }
+  }
+
+  function startPolling(jobId: string) {
+    clearInterval(pollRef.current)
+    pollRef.current = setInterval(() => pollJob(jobId), 1500)
   }
 
   async function startScrape() {
     if (!query.trim()) return
     setLogs(['🚀 Iniciando scrape...'])
 
-    const res = await fetch('/api/scraper/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, location, mode, gridZone, cellKm, maxResults, maxTotal, scrollPause, headless })
-    })
-    const { job, error } = await res.json()
-    if (error) { setLogs(l => [...l, `❌ ${error}`]); return }
-    setActiveJob(job)
-    pollRef.current = setInterval(() => pollJob(job.id), 1500)
+    try {
+      const res = await fetch('/api/scraper/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, location, mode, gridZone, cellKm, maxResults, maxTotal, scrollPause, headless: true })
+      })
+      const payload = await res.json()
+      if (!res.ok || payload.error) {
+        setLogs(l => [...l, `❌ ${payload.error || 'No se pudo iniciar el scraper'}`])
+        return
+      }
+      setActiveJob(payload.job)
+      startPolling(payload.job.id)
+    } catch (error) {
+      setLogs(l => [...l, `❌ No se pudo conectar con el servidor: ${error instanceof Error ? error.message : 'error desconocido'}`])
+    }
   }
 
   async function pollJob(jobId: string) {
-    const { data } = await supabase.from('scrape_jobs').select('*').eq('id', jobId).single()
+    const response = await fetch(`/api/local/jobs/${jobId}`)
+    if (!response.ok) return
+    const payload = await response.json()
+    const data = payload.data
     if (!data) return
     setActiveJob(data)
     setLogs(l => {
@@ -78,7 +100,7 @@ export default function ScraperPage() {
     setActiveJob(null)
   }
 
-  const running = activeJob && ['pending', 'running'].includes(activeJob?.status)
+  const running = Boolean(activeJob && ['pending', 'running'].includes(activeJob.status))
   const pct = activeJob?.total > 0 ? Math.round((activeJob.progress / activeJob.total) * 100) : 0
 
   const statusColor: Record<string, string> = {
@@ -96,107 +118,111 @@ export default function ScraperPage() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 20, alignItems: 'start' }}>
         {/* Config */}
         <div className="card" style={{ padding: 24 }}>
-          {/* Mode toggle */}
-          <div style={{ display: 'flex', gap: 0, marginBottom: 24, background: 'var(--bg3)',
-            borderRadius: 10, padding: 4 }}>
-            {(['simple', 'grid'] as const).map(m => (
-              <button key={m} onClick={() => setMode(m)} style={{
-                flex: 1, padding: '8px', borderRadius: 8, border: 'none', cursor: 'pointer',
-                fontFamily: 'Syne', fontWeight: 600, fontSize: '0.84rem',
-                transition: 'all 0.15s',
-                background: mode === m ? 'var(--accent)' : 'transparent',
-                color: mode === m ? 'white' : 'var(--text2)',
-              }}>
-                {m === 'simple' ? '🎯 Zona simple' : '🗺 Cuadrícula por región'}
-              </button>
-            ))}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-            {/* Query */}
-            <div style={{ gridColumn: '1/-1' }}>
-              <label>Qué buscar *</label>
-              <input value={query} onChange={e => setQuery(e.target.value)}
-                placeholder='ej: "dentistas", "restaurantes italianos", "fontaneros"' />
+          {running ? (
+            <div style={{ padding: 20, borderRadius: 12, background: 'var(--bg3)', display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <p style={{ margin: 0, color: 'var(--text2)', fontSize: '0.9rem' }}>
+                Hay un scrape en curso. Espera a que termine para lanzar otro.
+              </p>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button className="btn btn-primary" disabled>
+                  <Play size={15} /> Iniciar Scraping
+                </button>
+                <button className="btn btn-danger" onClick={cancelJob}>
+                  <StopCircle size={15} /> Cancelar
+                </button>
+              </div>
             </div>
+          ) : (
+            <>
+              {/* Mode toggle */}
+              <div style={{ display: 'flex', gap: 0, marginBottom: 24, background: 'var(--bg3)',
+                borderRadius: 10, padding: 4 }}>
+                {(['simple', 'grid'] as const).map(m => (
+                  <button key={m} onClick={() => setMode(m)} style={{
+                    flex: 1, padding: '8px', borderRadius: 8, border: 'none', cursor: 'pointer',
+                    fontFamily: 'Syne', fontWeight: 600, fontSize: '0.84rem',
+                    transition: 'all 0.15s',
+                    background: mode === m ? 'var(--accent)' : 'transparent',
+                    color: mode === m ? 'white' : 'var(--text2)',
+                  }}>
+                    {m === 'simple' ? '🎯 Zona simple' : '🗺 Cuadrícula por región'}
+                  </button>
+                ))}
+              </div>
 
-            {mode === 'simple' ? (<>
-              <div style={{ gridColumn: '1/-1' }}>
-                <label>Zona / Ciudad</label>
-                <input value={location} onChange={e => setLocation(e.target.value)}
-                  placeholder='ej: Madrid centro, Alcobendas, Getafe' />
-              </div>
-              <div>
-                <label>Máximo resultados</label>
-                <select value={maxResults} onChange={e => setMaxResults(e.target.value)}>
-                  {['20','50','100','200'].map(v => <option key={v} value={v}>{v}</option>)}
-                </select>
-              </div>
-            </>) : (<>
-              <div style={{ gridColumn: '1/-1' }}>
-                <label>Región predefinida</label>
-                <select value={gridZone} onChange={e => setGridZone(e.target.value)}>
-                  <option value="">— Selecciona zona —</option>
-                  {PRESET_ZONES.map(z => (
-                    <option key={z} value={z}>{z.charAt(0).toUpperCase() + z.slice(1)}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label>Tamaño de celda</label>
-                <select value={cellKm} onChange={e => setCellKm(e.target.value)}>
-                  <option value="0">Auto (recomendado)</option>
-                  <option value="4">4 km — ciudad densa</option>
-                  <option value="8">8 km — área metropolitana</option>
-                  <option value="12">12 km — provincia</option>
-                  <option value="20">20 km — región grande</option>
-                </select>
-              </div>
-              <div>
-                <label>Máx resultados / celda</label>
-                <select value={maxResults} onChange={e => setMaxResults(e.target.value)}>
-                  {['20','50','100'].map(v => <option key={v} value={v}>{v}</option>)}
-                </select>
-              </div>
-              <div>
-                <label>Máximo total</label>
-                <select value={maxTotal} onChange={e => setMaxTotal(e.target.value)}>
-                  {['500','1000','2000','5000'].map(v => (
-                    <option key={v} value={v}>{parseInt(v).toLocaleString()}</option>
-                  ))}
-                </select>
-              </div>
-            </>)}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                {/* Query */}
+                <div style={{ gridColumn: '1/-1' }}>
+                  <label>Qué buscar *</label>
+                  <input value={query} onChange={e => setQuery(e.target.value)}
+                    placeholder='ej: "dentistas", "restaurantes italianos", "fontaneros"' />
+                </div>
 
-            <div>
-              <label>Pausa scroll</label>
-              <select value={scrollPause} onChange={e => setScrollPause(e.target.value)}>
-                <option value="1.5">1.5s rápido</option>
-                <option value="2.0">2.0s normal</option>
-                <option value="3.0">3.0s seguro</option>
-              </select>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'flex-end', paddingBottom: 2 }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
-                textTransform: 'none', letterSpacing: 0, fontSize: '0.87rem', color: 'var(--text2)' }}>
-                <input type="checkbox" checked={headless} onChange={e => setHeadless(e.target.checked)}
-                  style={{ width: 'auto', accentColor: 'var(--accent)' }} />
-                Sin ventana (headless)
-              </label>
-            </div>
-          </div>
+                {mode === 'simple' ? (<>
+                  <div style={{ gridColumn: '1/-1' }}>
+                    <label>Zona / Ciudad</label>
+                    <input value={location} onChange={e => setLocation(e.target.value)}
+                      placeholder='ej: Madrid centro, Alcobendas, Getafe' />
+                  </div>
+                  <div>
+                    <label>Máximo resultados</label>
+                    <select value={maxResults} onChange={e => setMaxResults(e.target.value)}>
+                      {['20','50','100','200'].map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </div>
+                </>) : (<>
+                  <div style={{ gridColumn: '1/-1' }}>
+                    <label>Región predefinida</label>
+                    <select value={gridZone} onChange={e => setGridZone(e.target.value)}>
+                      <option value="">— Selecciona zona —</option>
+                      {PRESET_ZONES.map(z => (
+                        <option key={z} value={z}>{z.charAt(0).toUpperCase() + z.slice(1)}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Tamaño de celda</label>
+                    <select value={cellKm} onChange={e => setCellKm(e.target.value)}>
+                      <option value="0">Auto (recomendado)</option>
+                      <option value="4">4 km — ciudad densa</option>
+                      <option value="8">8 km — área metropolitana</option>
+                      <option value="12">12 km — provincia</option>
+                      <option value="20">20 km — región grande</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label>Máx resultados / celda</label>
+                    <select value={maxResults} onChange={e => setMaxResults(e.target.value)}>
+                      {['20','50','100'].map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label>Máximo total</label>
+                    <select value={maxTotal} onChange={e => setMaxTotal(e.target.value)}>
+                      {['500','1000','2000','5000'].map(v => (
+                        <option key={v} value={v}>{parseInt(v).toLocaleString()}</option>
+                      ))}
+                    </select>
+                  </div>
+                </>)}
 
-          <div style={{ marginTop: 20, display: 'flex', gap: 10 }}>
-            <button className="btn btn-primary" onClick={startScrape} disabled={running || !query.trim()}>
-              <Play size={15} />
-              {running ? 'Scrapeando...' : 'Iniciar Scraping'}
-            </button>
-            {running && (
-              <button className="btn btn-danger" onClick={cancelJob}>
-                <StopCircle size={15} /> Cancelar
-              </button>
-            )}
-          </div>
+                <div>
+                  <label>Pausa scroll</label>
+                  <select value={scrollPause} onChange={e => setScrollPause(e.target.value)}>
+                    <option value="1.5">1.5s rápido</option>
+                    <option value="2.0">2.0s normal</option>
+                    <option value="3.0">3.0s seguro</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 20, display: 'flex', gap: 10 }}>
+                <button className="btn btn-primary" onClick={startScrape} disabled={!query.trim()}>
+                  <Play size={15} /> Iniciar Scraping
+                </button>
+              </div>
+            </>
+          )}
 
           {/* Progress */}
           {activeJob && (

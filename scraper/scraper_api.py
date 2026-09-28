@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-scraper_api.py — Versión del scraper integrada con Supabase.
-Reporta progreso en tiempo real y guarda negocios directamente en la BD.
+scraper_api.py — Scraper local integrado con SQLite.
+Reporta progreso en tiempo real y guarda negocios directamente en la base local.
 
 Uso (lanzado por Next.js API route):
   python scraper_api.py \
-    --job-id <uuid> --user-id <uuid> \
-    --supabase-url https://xxx.supabase.co \
-    --supabase-key <service_role_key> \
+    --job-id <uuid> --db-path ../data/scrapcrm.sqlite \
     --query "dentistas" --mode grid --grid-zone "comunidad de madrid" \
     --max 50 --max-total 1000 --headless
 """
@@ -15,12 +13,14 @@ Uso (lanzado por Next.js API route):
 import re
 import sys
 import json
+import sqlite3
 import time
 import logging
 import argparse
 import unicodedata
+import uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── Add scraper dir to path so we can import zone_mapper ─────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
@@ -31,71 +31,94 @@ except ImportError:
     print("ERROR: playwright not installed. Run: pip install playwright && python -m playwright install chromium", file=sys.stderr)
     sys.exit(1)
 
-try:
-    from supabase import create_client, Client
-except ImportError:
-    print("ERROR: supabase not installed. Run: pip install supabase", file=sys.stderr)
-    sys.exit(1)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Supabase reporter ────────────────────────────────────────────────────────
+# ─── SQLite reporter ──────────────────────────────────────────────────────────
+
+def ensure_database(db_path: str):
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=30) as db:
+        db.execute('PRAGMA busy_timeout=30000')
+        db.execute('PRAGMA foreign_keys=ON')
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS scrape_jobs (
+              id TEXT PRIMARY KEY, query TEXT NOT NULL, zone TEXT,
+              mode TEXT NOT NULL DEFAULT 'simple', cell_km REAL DEFAULT 8,
+              max_results INTEGER DEFAULT 50, max_total INTEGER DEFAULT 1000,
+              status TEXT NOT NULL DEFAULT 'pending', progress INTEGER DEFAULT 0,
+              total INTEGER DEFAULT 0, phase TEXT DEFAULT '', businesses_found INTEGER DEFAULT 0,
+              error_msg TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS businesses (
+              id TEXT PRIMARY KEY, job_id TEXT REFERENCES scrape_jobs(id) ON DELETE SET NULL,
+              name TEXT NOT NULL, category TEXT, address TEXT, city TEXT, province TEXT,
+              postal_code TEXT, phone TEXT, website TEXT, email TEXT, rating REAL,
+              reviews_count INTEGER, hours TEXT, price_range TEXT, description TEXT,
+              google_maps_url TEXT, plus_code TEXT, status TEXT NOT NULL DEFAULT 'not_contacted',
+              notes TEXT, tags TEXT NOT NULL DEFAULT '[]', assigned_to TEXT,
+              last_contact TEXT, next_followup TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(name, address)
+            );
+            CREATE TABLE IF NOT EXISTS followups (
+              id TEXT PRIMARY KEY, business_id TEXT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+              type TEXT NOT NULL, content TEXT, outcome TEXT, scheduled_at TEXT,
+              completed_at TEXT, created_at TEXT NOT NULL
+            );
+        ''')
 
 class JobReporter:
-    def __init__(self, sb: Client, job_id: str, user_id: str):
-        self.sb = sb
+    def __init__(self, db_path: str, job_id: str):
+        self.db_path = db_path
         self.job_id = job_id
-        self.user_id = user_id
         self._businesses_found = 0
-        self._cancelled = False
+
+    def _execute(self, sql: str, params=(), fetch=False):
+        with sqlite3.connect(self.db_path, timeout=30) as db:
+            db.execute('PRAGMA busy_timeout=30000')
+            cursor = db.execute(sql, params)
+            return cursor.fetchone() if fetch else None
 
     def update(self, progress: int, total: int, phase: str):
         try:
-            self.sb.table('scrape_jobs').update({
-                'progress': progress,
-                'total': total,
-                'phase': phase[:200],
-                'businesses_found': self._businesses_found,
-            }).eq('id', self.job_id).execute()
+            self._execute('''
+                UPDATE scrape_jobs SET progress = ?, total = ?, phase = ?, businesses_found = ?
+                WHERE id = ?
+            ''', (progress, total, phase[:200], self._businesses_found, self.job_id))
         except Exception as e:
             log.warning(f"Reporter update failed: {e}")
 
     def is_cancelled(self) -> bool:
         try:
-            r = self.sb.table('scrape_jobs').select('status').eq('id', self.job_id).single().execute()
-            return r.data.get('status') == 'cancelled'
+            row = self._execute('SELECT status FROM scrape_jobs WHERE id = ?', (self.job_id,), fetch=True)
+            return bool(row and row[0] == 'cancelled')
         except Exception:
             return False
 
     def done(self, businesses_found: int):
         try:
-            self.sb.table('scrape_jobs').update({
-                'status': 'done',
-                'progress': businesses_found,
-                'total': businesses_found,
-                'businesses_found': businesses_found,
-                'phase': f'Completado: {businesses_found} negocios',
-                'finished_at': datetime.utcnow().isoformat(),
-            }).eq('id', self.job_id).execute()
+            self._execute('''
+                UPDATE scrape_jobs SET status = 'done', progress = ?, total = ?,
+                businesses_found = ?, phase = ?, finished_at = ? WHERE id = ?
+            ''', (businesses_found, businesses_found, businesses_found,
+                  f'Completado: {businesses_found} negocios', datetime.now(timezone.utc).isoformat(), self.job_id))
         except Exception as e:
             log.warning(f"Reporter done failed: {e}")
 
     def error(self, msg: str):
         try:
-            self.sb.table('scrape_jobs').update({
-                'status': 'error',
-                'error_msg': msg[:500],
-                'finished_at': datetime.utcnow().isoformat(),
-            }).eq('id', self.job_id).execute()
+            self._execute('''
+                UPDATE scrape_jobs SET status = 'error', error_msg = ?, finished_at = ?
+                WHERE id = ?
+            ''', (msg[:500], datetime.now(timezone.utc).isoformat(), self.job_id))
         except Exception as e:
             log.warning(f"Reporter error failed: {e}")
 
     def save_business(self, biz: dict) -> bool:
-        """Upsert a business to Supabase. Returns True if new."""
+        """Upsert a business to SQLite. Returns True if saved."""
         try:
             record = {
-                'user_id': self.user_id,
+                'id': str(uuid.uuid4()),
                 'job_id': self.job_id,
                 **{k: v for k, v in biz.items() if v not in (None, '', [])},
             }
@@ -113,7 +136,24 @@ class JobReporter:
             if 'reviews_count' in record:
                 record['reviews_count'] = parse_reviews(record['reviews_count'])
 
-            self.sb.table('businesses').upsert(record, on_conflict='user_id,name,address').execute()
+            record.setdefault('tags', '[]')
+            record['updated_at'] = datetime.now(timezone.utc).isoformat()
+            record['created_at'] = record['updated_at']
+            columns = [
+                'id', 'job_id', 'name', 'category', 'address', 'city', 'province', 'postal_code',
+                'phone', 'website', 'email', 'rating', 'reviews_count', 'hours', 'price_range',
+                'description', 'google_maps_url', 'plus_code', 'tags', 'created_at', 'updated_at',
+            ]
+            values = [record.get(column) for column in columns]
+            placeholders = ', '.join('?' for _ in columns)
+            updates = ', '.join(
+                f"{column} = COALESCE(excluded.{column}, businesses.{column})"
+                for column in columns if column not in ('id', 'name', 'address', 'created_at')
+            )
+            self._execute(f'''
+                INSERT INTO businesses ({', '.join(columns)}) VALUES ({placeholders})
+                ON CONFLICT(name, address) DO UPDATE SET {updates}
+            ''', values)
             self._businesses_found += 1
             return True
         except Exception as e:
@@ -410,9 +450,7 @@ def extract_all(page: Page, urls: list[str], reporter: JobReporter,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--job-id',       required=True)
-    parser.add_argument('--user-id',      required=True)
-    parser.add_argument('--supabase-url', required=True)
-    parser.add_argument('--supabase-key', required=True)
+    parser.add_argument('--db-path',      required=True)
     parser.add_argument('--query',        required=True)
     parser.add_argument('--mode',         default='simple')
     parser.add_argument('--location',     default='')
@@ -424,8 +462,8 @@ def main():
     parser.add_argument('--headless',     action='store_true')
     args = parser.parse_args()
 
-    sb = create_client(args.supabase_url, args.supabase_key)
-    reporter = JobReporter(sb, args.job_id, args.user_id)
+    ensure_database(args.db_path)
+    reporter = JobReporter(args.db_path, args.job_id)
 
     log.info(f"Job {args.job_id}: query='{args.query}' mode={args.mode} headless={args.headless}")
 

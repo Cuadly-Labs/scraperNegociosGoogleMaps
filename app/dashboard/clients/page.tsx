@@ -1,8 +1,7 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { createClient } from '@/lib/supabase/client'
 import { Business, Followup } from '@/lib/types'
-import { Phone, Mail, Globe, Plus, Check, Calendar, MessageSquare, Users, Star } from 'lucide-react'
+import { Phone, Mail, Globe, Plus, Check, MessageSquare, Users, Star } from 'lucide-react'
 
 const FOLLOWUP_TYPES = [
   { value: 'call', label: '📞 Llamada', color: '#10b981' },
@@ -13,7 +12,6 @@ const FOLLOWUP_TYPES = [
 ]
 
 export default function ClientsPage() {
-  const supabase = createClient()
   const [clients, setClients] = useState<Business[]>([])
   const [selected, setSelected] = useState<Business | null>(null)
   const [followups, setFollowups] = useState<Followup[]>([])
@@ -25,32 +23,39 @@ export default function ClientsPage() {
   useEffect(() => { if (selected) loadFollowups(selected.id) }, [selected])
 
   async function loadClients() {
-    const { data } = await supabase.from('businesses').select('*')
-      .eq('status', 'client').order('updated_at', { ascending: false })
-    setClients(data as Business[] || [])
+    const response = await fetch('/api/local/businesses?status=client&pageSize=1000')
+    const payload = await response.json()
+    setClients(payload.data as Business[] || [])
     setLoading(false)
   }
 
   async function loadFollowups(businessId: string) {
-    const { data } = await supabase.from('followups').select('*')
-      .eq('business_id', businessId).order('created_at', { ascending: false })
-    setFollowups(data as Followup[] || [])
+    const response = await fetch(`/api/local/followups?businessId=${encodeURIComponent(businessId)}`)
+    const payload = await response.json()
+    setFollowups(payload.data as Followup[] || [])
   }
 
   async function addFollowup() {
     if (!selected || !newFollowup.content) return
-    const { data } = await supabase.from('followups').insert({
-      business_id: selected.id,
-      ...newFollowup,
-      scheduled_at: newFollowup.scheduled_at || null,
-      completed_at: new Date().toISOString(),
-    }).select().single()
-    if (data) {
-      setFollowups(f => [data as Followup, ...f])
+    const response = await fetch('/api/local/followups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        businessId: selected.id,
+        type: newFollowup.type,
+        content: newFollowup.content,
+        outcome: newFollowup.outcome,
+        scheduledAt: newFollowup.scheduled_at || null,
+      }),
+    })
+    const payload = await response.json()
+    if (response.ok && payload.data) {
+      setFollowups(f => [payload.data as Followup, ...f])
       setNewFollowup({ type: 'call', content: '', outcome: '', scheduled_at: '' })
       setAddingFollowup(false)
-      // Update last contact
-      await supabase.from('businesses').update({ last_contact: new Date().toISOString() }).eq('id', selected.id)
+      setClients(cs => cs.map(c => c.id === selected.id
+        ? { ...c, last_contact: new Date().toISOString() }
+        : c))
     }
   }
 
@@ -75,7 +80,7 @@ export default function ClientsPage() {
           <Users size={48} style={{ color: 'var(--text3)', marginBottom: 16 }} />
           <h3 style={{ marginBottom: 8 }}>Sin clientes aún</h3>
           <p style={{ color: 'var(--text2)', fontSize: '0.87rem', maxWidth: 320, margin: '0 auto' }}>
-            Cuando marques un lead como "Cliente" en la Base de Leads, aparecerá aquí para su seguimiento.
+            Cuando marques un lead como &quot;Cliente&quot; en la Base de Leads, aparecerá aquí para su seguimiento.
           </p>
         </div>
       ) : (
